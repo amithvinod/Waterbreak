@@ -16,7 +16,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
     <div className="flex flex-col min-h-[100dvh]">
       {/* Main content */}
       <main className="flex-1 pb-20 md:pb-0 md:pl-20 lg:pl-64">
-        <div className="max-w-3xl mx-auto px-4 sm:px-6 py-6 sm:py-8">
+        <div className="max-w-3xl mx-auto px-4 sm:px-6 py-6 sm:py-8 pt-safe">
           {children}
         </div>
       </main>

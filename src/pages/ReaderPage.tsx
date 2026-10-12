@@ -10,7 +10,6 @@ import SessionProgress from '../components/SessionProgress';
 import QuitModal from '../components/QuitModal';
 import SessionComplete from '../components/SessionComplete';
 
-
 export default function ReaderPage() {
   const { bookId } = useParams<{ bookId: string }>();
   const navigate = useNavigate();
@@ -25,16 +24,43 @@ export default function ReaderPage() {
   const [totalPages, setTotalPages] = useState(book?.totalPages ?? 0);
   const [rendering, setRendering] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [showControls, setShowControls] = useState(true);
+  // Default to full-screen reading mode: only the PDF page is visible
+  const [showControls, setShowControls] = useState(false);
+  const [pageBadgeVisible, setPageBadgeVisible] = useState(false);
   const [showQuitModal, setShowQuitModal] = useState(false);
   const [showCompleteScreen, setShowCompleteScreen] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [scale, setScale] = useState(1.0);
+  const [viewportDimensions, setViewportDimensions] = useState({
+    width: typeof window !== 'undefined' ? window.innerWidth : 390,
+    height: typeof window !== 'undefined' ? window.innerHeight : 844,
+  });
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapperRef = useRef<HTMLDivElement>(null);
   const renderTaskRef = useRef<pdfjs.RenderTask | null>(null);
   const controlsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const badgeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Touch gesture tracking for iOS
+  const touchStartRef = useRef<{ x: number; y: number; time: number } | null>(null);
+  const lastTouchEndRef = useRef<number>(0);
+
+  // ── Handle screen resize / orientation change ──────────────────────────────
+  useEffect(() => {
+    const handleResize = () => {
+      setViewportDimensions({
+        width: window.innerWidth,
+        height: window.innerHeight,
+      });
+    };
+    window.addEventListener('resize', handleResize);
+    window.addEventListener('orientationchange', handleResize);
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      window.removeEventListener('orientationchange', handleResize);
+    };
+  }, []);
 
   // ── Load PDF document from ArrayBuffer ──────────────────────────────────────
   useEffect(() => {
@@ -45,7 +71,6 @@ export default function ReaderPage() {
 
     const load = async () => {
       try {
-        // Clone the buffer so pdfjs owns its own copy
         const copy = book.fileData.slice(0);
         const loadingTask = pdfjs.getDocument({ data: copy });
         docRef = await loadingTask.promise;
@@ -62,17 +87,15 @@ export default function ReaderPage() {
     return () => {
       docRef?.destroy();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [book?.id]);
 
-  // ── Render the current page onto <canvas> ───────────────────────────────────
+  // ── Render current page onto <canvas> ───────────────────────────────────────
   useEffect(() => {
     if (!pdfDoc || !canvasRef.current) return;
 
     let cancelled = false;
 
     const render = async () => {
-      // Cancel any in-flight render
       if (renderTaskRef.current) {
         renderTaskRef.current.cancel();
         renderTaskRef.current = null;
@@ -87,12 +110,18 @@ export default function ReaderPage() {
         const canvas = canvasRef.current!;
         const ctx = canvas.getContext('2d', { alpha: false })!;
 
-        // Fit to wrapper width
-        const wrapperWidth = wrapperRef.current?.clientWidth ?? window.innerWidth;
-        const baseScale = Math.min((wrapperWidth - 32) / page.getViewport({ scale: 1 }).width, 1.6);
+        const availableWidth = wrapperRef.current?.clientWidth || window.innerWidth;
+        const availableHeight = wrapperRef.current?.clientHeight || window.innerHeight;
+        const unscaledViewport = page.getViewport({ scale: 1 });
+
+        // Fit page comfortably to viewport (fill width or height)
+        const scaleW = availableWidth / unscaledViewport.width;
+        const scaleH = availableHeight / unscaledViewport.height;
+        const baseScale = Math.min(scaleW, scaleH);
         const viewport = page.getViewport({ scale: baseScale * scale });
 
-        const dpr = window.devicePixelRatio || 1;
+        // Cap DPR to 2.5 to prevent memory issues on iOS devices
+        const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
         canvas.width = Math.floor(viewport.width * dpr);
         canvas.height = Math.floor(viewport.height * dpr);
         canvas.style.width = `${Math.floor(viewport.width)}px`;
@@ -122,7 +151,21 @@ export default function ReaderPage() {
       cancelled = true;
       renderTaskRef.current?.cancel();
     };
-  }, [pdfDoc, currentPage, scale]);
+  }, [pdfDoc, currentPage, scale, viewportDimensions]);
+
+  // ── Show subtle brief page badge on page change ─────────────────────────────
+  useEffect(() => {
+    if (!showControls) {
+      setPageBadgeVisible(true);
+      if (badgeTimerRef.current) clearTimeout(badgeTimerRef.current);
+      badgeTimerRef.current = setTimeout(() => {
+        setPageBadgeVisible(false);
+      }, 1400);
+    }
+    return () => {
+      if (badgeTimerRef.current) clearTimeout(badgeTimerRef.current);
+    };
+  }, [currentPage, showControls]);
 
   // ── Persist progress ─────────────────────────────────────────────────────────
   useEffect(() => {
@@ -134,49 +177,30 @@ export default function ReaderPage() {
     }
   }, [currentPage]);
 
-  // ── Keyboard shortcuts ───────────────────────────────────────────────────────
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); goNext(); }
-      else if (e.key === 'ArrowLeft')               { e.preventDefault(); goPrev(); }
-      else if (e.key === '=' || e.key === '+')      { e.preventDefault(); setScale(s => Math.min(s + 0.2, 3)); }
-      else if (e.key === '-')                       { e.preventDefault(); setScale(s => Math.max(s - 0.2, 0.5)); }
-      else if (e.key === 'Escape')                  { if (isFullscreen) document.exitFullscreen(); else handleExit(); }
-    };
-
-    const onFsChange = () => {
-      setIsFullscreen(!!document.fullscreenElement);
-      if (!document.fullscreenElement) setShowControls(true);
-    };
-
-    window.addEventListener('keydown', onKey);
-    document.addEventListener('fullscreenchange', onFsChange);
-    return () => {
-      window.removeEventListener('keydown', onKey);
-      document.removeEventListener('fullscreenchange', onFsChange);
-    };
-  }, [currentPage, totalPages, isFullscreen]);
-
-  // ── Controls auto-hide ───────────────────────────────────────────────────────
-  const bumpControls = useCallback(() => {
-    setShowControls(true);
-    if (controlsTimerRef.current) clearTimeout(controlsTimerRef.current);
-    controlsTimerRef.current = setTimeout(() => {
-      if (document.fullscreenElement) setShowControls(false);
-    }, 3000);
-  }, []);
-
-  if (!book) return null;
-
   // ── Navigation ───────────────────────────────────────────────────────────────
-  const goNext = () => { if (currentPage < totalPages) { setCurrentPage(p => p + 1); window.scrollTo(0, 0); } };
-  const goPrev = () => { if (currentPage > 1)          { setCurrentPage(p => p - 1); window.scrollTo(0, 0); } };
+  const goNext = useCallback(() => {
+    if (currentPage < totalPages) {
+      setCurrentPage((p) => p + 1);
+      window.scrollTo(0, 0);
+    }
+  }, [currentPage, totalPages]);
 
-  const handleExit = () => {
-    if (session && !session.completed && currentPage < session.targetPage) setShowQuitModal(true);
-    else if (session && !session.completed && currentPage >= session.targetPage) handleDone();
-    else navigate('/');
-  };
+  const goPrev = useCallback(() => {
+    if (currentPage > 1) {
+      setCurrentPage((p) => p - 1);
+      window.scrollTo(0, 0);
+    }
+  }, [currentPage]);
+
+  const handleExit = useCallback(() => {
+    if (session && !session.completed && currentPage < session.targetPage) {
+      setShowQuitModal(true);
+    } else if (session && !session.completed && currentPage >= session.targetPage) {
+      handleDone();
+    } else {
+      navigate('/');
+    }
+  }, [session, currentPage, navigate]);
 
   const handleDone = async () => {
     if (session) await endSession(session.id, currentPage, true);
@@ -197,15 +221,136 @@ export default function ReaderPage() {
     navigate('/');
   };
 
-  const toggleFullscreen = () =>
-    document.fullscreenElement
-      ? document.exitFullscreen()
-      : document.documentElement.requestFullscreen().catch(() => {});
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    } else {
+      document.documentElement.requestFullscreen().catch(() => {});
+    }
+  };
 
-  // ── Theme ────────────────────────────────────────────────────────────────────
+  // ── Controls toggle & auto-hide ─────────────────────────────────────────────
+  const hideControls = useCallback(() => {
+    setShowControls(false);
+    if (controlsTimerRef.current) clearTimeout(controlsTimerRef.current);
+  }, []);
+
+  const toggleControls = useCallback(() => {
+    setShowControls((prev) => {
+      if (prev) {
+        if (controlsTimerRef.current) clearTimeout(controlsTimerRef.current);
+        return false;
+      } else {
+        if (controlsTimerRef.current) clearTimeout(controlsTimerRef.current);
+        controlsTimerRef.current = setTimeout(() => {
+          setShowControls(false);
+        }, 3500);
+        return true;
+      }
+    });
+  }, []);
+
+  // ── Touch and Gesture Handlers (iOS optimized) ──────────────────────────────
+  const handleTouchStart = (e: React.TouchEvent) => {
+    if (e.touches.length === 1) {
+      const t = e.touches[0];
+      touchStartRef.current = { x: t.clientX, y: t.clientY, time: Date.now() };
+    }
+  };
+
+  const handleTouchEnd = (e: React.TouchEvent) => {
+    if (!touchStartRef.current) return;
+    lastTouchEndRef.current = Date.now();
+
+    const t = e.changedTouches[0];
+    const deltaX = t.clientX - touchStartRef.current.x;
+    const deltaY = t.clientY - touchStartRef.current.y;
+    const deltaTime = Date.now() - touchStartRef.current.time;
+
+    // 1. SWIPE LEFT TO RIGHT -> Escapes/Exits reader (as requested)
+    if (deltaX > 55 && Math.abs(deltaY) < 65 && deltaTime < 600) {
+      touchStartRef.current = null;
+      handleExit();
+      return;
+    }
+
+    // 2. TAP (minimal movement)
+    if (Math.abs(deltaX) < 15 && Math.abs(deltaY) < 15) {
+      const screenWidth = window.innerWidth;
+      const tapX = t.clientX;
+      const ratio = tapX / screenWidth;
+
+      if (showControls) {
+        // If notification / control bar is showing, tap dismisses it immediately (goes up)
+        hideControls();
+      } else {
+        if (ratio < 0.35) {
+          // Tap left -> Previous page
+          goPrev();
+        } else if (ratio > 0.65) {
+          // Tap right -> Next page
+          goNext();
+        } else {
+          // Tap center -> Toggle controls
+          toggleControls();
+        }
+      }
+    }
+
+    touchStartRef.current = null;
+  };
+
+  // ── Desktop Click Handler (Fallback for mouse) ──────────────────────────────
+  const handleClick = (e: React.MouseEvent) => {
+    // Prevent synthetic click from firing after touch
+    if (Date.now() - lastTouchEndRef.current < 500) return;
+
+    const screenWidth = window.innerWidth;
+    const clickX = e.clientX;
+    const ratio = clickX / screenWidth;
+
+    if (showControls) {
+      hideControls();
+    } else {
+      if (ratio < 0.35) {
+        goPrev();
+      } else if (ratio > 0.65) {
+        goNext();
+      } else {
+        toggleControls();
+      }
+    }
+  };
+
+  // ── Keyboard shortcuts ───────────────────────────────────────────────────────
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); goNext(); }
+      else if (e.key === 'ArrowLeft')               { e.preventDefault(); goPrev(); }
+      else if (e.key === '=' || e.key === '+')      { e.preventDefault(); setScale(s => Math.min(s + 0.2, 3)); }
+      else if (e.key === '-')                       { e.preventDefault(); setScale(s => Math.max(s - 0.2, 0.5)); }
+      else if (e.key === 'Escape')                  { if (isFullscreen) document.exitFullscreen(); else handleExit(); }
+    };
+
+    const onFsChange = () => {
+      setIsFullscreen(!!document.fullscreenElement);
+    };
+
+    window.addEventListener('keydown', onKey);
+    document.addEventListener('fullscreenchange', onFsChange);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      document.removeEventListener('fullscreenchange', onFsChange);
+    };
+  }, [goNext, goPrev, handleExit, isFullscreen]);
+
+  if (!book) return null;
+
+  // ── Theme Background (Eliminate all blue outlines) ──────────────────────────
+  // Light: pure white matching book page; Dark: deep black; Sepia: warm tone
   const bgClass =
-    readingTheme === 'dark'  ? 'bg-[#0f172a]' :
-    readingTheme === 'sepia' ? 'bg-[#fdf8f0]' : 'bg-[#f1f5f9]';
+    readingTheme === 'dark'  ? 'bg-black' :
+    readingTheme === 'sepia' ? 'bg-[#fdf8f0]' : 'bg-white';
 
   const canvasClass =
     readingTheme === 'dark'  ? 'brightness-[0.87] contrast-[1.05]' :
@@ -213,28 +358,29 @@ export default function ReaderPage() {
 
   return (
     <div
-      className={`min-h-[100dvh] flex flex-col ${bgClass} transition-colors duration-300`}
-      onClick={bumpControls}
+      className={`fixed inset-0 w-full h-[100dvh] flex flex-col ${bgClass} transition-colors duration-300 overflow-hidden select-none reader-container`}
     >
-      {/* ── Top bar ── */}
+      {/* ── Top Bar (Slides up/down, styled with iOS safe-area-inset-top) ── */}
       <AnimatePresence>
         {showControls && (
           <motion.header
             key="topbar"
-            initial={{ opacity: 0, y: -20 }}
+            initial={{ opacity: 0, y: -70 }}
             animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -20 }}
-            className="fixed top-0 left-0 right-0 h-14 flex items-center justify-between px-4 z-50
-                       bg-white/90 dark:bg-[#0f172a]/90 backdrop-blur-md
-                       border-b border-slate-200 dark:border-slate-700/50"
+            exit={{ opacity: 0, y: -70 }}
+            transition={{ duration: 0.22, ease: 'easeOut' }}
+            className="fixed top-0 left-0 right-0 z-50 flex items-center justify-between px-4
+                       pt-[env(safe-area-inset-top,0px)] h-[calc(3.5rem+env(safe-area-inset-top,0px))]
+                       bg-white/95 dark:bg-black/95 backdrop-blur-md
+                       border-b border-slate-200/80 dark:border-white/10 shadow-sm"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Left */}
             <div className="flex items-center gap-3">
               <button
                 onClick={handleExit}
-                className="w-9 h-9 flex items-center justify-center rounded-full
-                           hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-300 transition-colors"
+                className="w-10 h-10 flex items-center justify-center rounded-full
+                           hover:bg-slate-100 dark:hover:bg-white/10 text-slate-700 dark:text-slate-200 transition-colors"
                 aria-label="Exit reader"
               >
                 <X className="w-5 h-5" />
@@ -244,29 +390,34 @@ export default function ReaderPage() {
               </h1>
             </div>
 
-            {/* Right */}
+            {/* Mobile Title */}
+            <div className="sm:hidden text-xs font-semibold text-slate-700 dark:text-slate-300 truncate max-w-[140px]">
+              {book.title}
+            </div>
+
+            {/* Right Controls */}
             <div className="flex items-center gap-1">
               <button
                 onClick={() => setScale(s => Math.max(s - 0.2, 0.5))}
-                className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+                className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-slate-100 dark:hover:bg-white/10 transition-colors"
                 aria-label="Zoom out"
               >
-                <ZoomOut className="w-4 h-4 text-slate-500" />
+                <ZoomOut className="w-4 h-4 text-slate-600 dark:text-slate-400" />
               </button>
               <button
                 onClick={() => setScale(s => Math.min(s + 0.2, 3))}
-                className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+                className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-slate-100 dark:hover:bg-white/10 transition-colors"
                 aria-label="Zoom in"
               >
-                <ZoomIn className="w-4 h-4 text-slate-500" />
+                <ZoomIn className="w-4 h-4 text-slate-600 dark:text-slate-400" />
               </button>
-              <span className="text-xs font-medium text-slate-500 mx-2 min-w-[60px] text-center tabular-nums">
+              <span className="text-xs font-medium text-slate-600 dark:text-slate-400 mx-1 min-w-[55px] text-center tabular-nums">
                 {currentPage} / {totalPages}
               </span>
               <button
                 onClick={toggleFullscreen}
                 className="hidden md:flex w-8 h-8 items-center justify-center rounded-full
-                           hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-500 transition-colors"
+                           hover:bg-slate-100 dark:hover:bg-white/10 text-slate-600 dark:text-slate-400 transition-colors"
                 aria-label={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
               >
                 {isFullscreen ? <Minimize className="w-4 h-4" /> : <Maximize className="w-4 h-4" />}
@@ -276,68 +427,91 @@ export default function ReaderPage() {
         )}
       </AnimatePresence>
 
-      {/* ── Canvas area ── */}
+      {/* ── PDF Canvas Viewport (Edge-to-edge pure PDF view) ── */}
       <div
         ref={wrapperRef}
-        className="flex-1 flex flex-col items-center pt-16 pb-24 px-4 overflow-y-auto"
-        onClick={bumpControls}
+        className={`flex-1 flex items-center justify-center w-full h-[100dvh] ${scale > 1 ? 'overflow-auto' : 'overflow-hidden'} relative`}
+        onTouchStart={handleTouchStart}
+        onTouchEnd={handleTouchEnd}
+        onClick={handleClick}
       >
         {loadError ? (
-          <div className="flex flex-col items-center justify-center h-full gap-4 text-center">
+          <div className="flex flex-col items-center justify-center h-full gap-4 text-center px-4">
             <p className="text-red-500 font-medium">{loadError}</p>
-            <button onClick={() => navigate(-1)} className="text-sm text-slate-400 hover:text-slate-600">
+            <button
+              onClick={() => navigate(-1)}
+              className="text-sm text-slate-500 hover:text-slate-700 underline"
+            >
               Go back
             </button>
           </div>
         ) : (
-          <div className="relative inline-block">
-            {/* Loading spinner overlay */}
+          <div className="relative flex items-center justify-center">
             {rendering && (
-              <div className="absolute inset-0 flex items-center justify-center z-10 bg-white/40 dark:bg-black/30 rounded-lg">
-                <div className="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin" />
+              <div className="absolute inset-0 flex items-center justify-center z-10 bg-black/10 dark:bg-black/30 backdrop-blur-[1px]">
+                <div className="w-7 h-7 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin" />
               </div>
             )}
             <canvas
               ref={canvasRef}
-              className={`block rounded-lg shadow-xl ${canvasClass}`}
-              style={{ maxWidth: '100%' }}
+              className={`block max-w-full max-h-[100dvh] ${canvasClass}`}
             />
           </div>
         )}
       </div>
 
-      {/* ── Session progress chip ── */}
+      {/* ── Minimal Page Number Toast on Page Turn (Non-intrusive) ── */}
       <AnimatePresence>
-        {session && !session.completed && (
+        {!showControls && pageBadgeVisible && (
+          <motion.div
+            initial={{ opacity: 0, scale: 0.9 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.9 }}
+            transition={{ duration: 0.15 }}
+            className="fixed bottom-6 left-1/2 -translate-x-1/2 z-30 pointer-events-none
+                       px-3 py-1 rounded-full text-xs font-medium tabular-nums
+                       bg-black/60 text-white/95 dark:bg-white/20 dark:text-white backdrop-blur-sm shadow-sm"
+          >
+            {currentPage} / {totalPages}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Session Progress Chip (Visible when controls toggled) ── */}
+      <AnimatePresence>
+        {showControls && session && !session.completed && (
           <motion.div
             key="session-progress"
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: 20 }}
-            className="fixed bottom-20 left-1/2 -translate-x-1/2 w-[90%] max-w-sm z-30"
+            transition={{ duration: 0.2 }}
+            className="fixed bottom-[calc(4.5rem+env(safe-area-inset-bottom,0px))] left-1/2 -translate-x-1/2 w-[90%] max-w-sm z-40"
             onClick={(e) => e.stopPropagation()}
           >
             <SessionProgress
               currentPage={currentPage}
               targetPage={session.targetPage}
               startingPage={session.startingPage}
-              className="bg-white/85 dark:bg-slate-800/85 shadow-xl border border-slate-200 dark:border-slate-700/50"
+              className="bg-white/95 dark:bg-zinc-900/95 shadow-xl border border-slate-200 dark:border-white/10"
             />
           </motion.div>
         )}
       </AnimatePresence>
 
-      {/* ── Bottom nav ── */}
+      {/* ── Bottom Nav (Slides down/up, styled with iOS safe-area-inset-bottom) ── */}
       <AnimatePresence>
         {showControls && (
           <motion.nav
             key="bottomnav"
-            initial={{ opacity: 0, y: 20 }}
+            initial={{ opacity: 0, y: 70 }}
             animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 20 }}
-            className="fixed bottom-0 left-0 right-0 h-16 flex items-center justify-center gap-6 px-6 z-50
-                       bg-white/90 dark:bg-[#0f172a]/90 backdrop-blur-md
-                       border-t border-slate-200 dark:border-slate-700/50"
+            exit={{ opacity: 0, y: 70 }}
+            transition={{ duration: 0.22, ease: 'easeOut' }}
+            className="fixed bottom-0 left-0 right-0 z-50 flex items-center justify-center gap-6 px-6
+                       pb-[env(safe-area-inset-bottom,0px)] h-[calc(4rem+env(safe-area-inset-bottom,0px))]
+                       bg-white/95 dark:bg-black/95 backdrop-blur-md
+                       border-t border-slate-200/80 dark:border-white/10 shadow-lg"
             onClick={(e) => e.stopPropagation()}
           >
             <button
@@ -345,7 +519,7 @@ export default function ReaderPage() {
               onClick={goPrev}
               disabled={currentPage <= 1}
               className="flex items-center gap-2 px-5 py-2.5 rounded-full
-                         bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700
+                         bg-slate-100 hover:bg-slate-200 dark:bg-white/10 dark:hover:bg-white/20
                          text-slate-900 dark:text-slate-100
                          disabled:opacity-30 transition-colors font-medium text-sm"
             >
@@ -353,12 +527,16 @@ export default function ReaderPage() {
               Previous
             </button>
 
+            <span className="text-xs font-medium text-slate-500 tabular-nums">
+              {currentPage} of {totalPages}
+            </span>
+
             <button
               id="next-page-btn"
               onClick={goNext}
               disabled={currentPage >= totalPages}
               className="flex items-center gap-2 px-5 py-2.5 rounded-full
-                         bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700
+                         bg-slate-100 hover:bg-slate-200 dark:bg-white/10 dark:hover:bg-white/20
                          text-slate-900 dark:text-slate-100
                          disabled:opacity-30 transition-colors font-medium text-sm"
             >
@@ -369,7 +547,7 @@ export default function ReaderPage() {
         )}
       </AnimatePresence>
 
-      {/* ── Quit modal ── */}
+      {/* ── Quit Modal ── */}
       {session && (
         <QuitModal
           isOpen={showQuitModal}
@@ -381,7 +559,7 @@ export default function ReaderPage() {
         />
       )}
 
-      {/* ── Session complete ── */}
+      {/* ── Session Complete Screen ── */}
       {session && showCompleteScreen && (
         <SessionComplete
           isOpen={showCompleteScreen}
